@@ -17,6 +17,11 @@ from tensorflow.keras.applications.resnet50 import ResNet50
 from tensorflow.keras.applications.resnet50 import decode_predictions
 
 from AdR.utils import *
+from AdR.data import *
+
+# ---------- FIXES BIG --------------------------- #
+tf.config.experimental_run_functions_eagerly(True)
+# ------------------------------------------------ #
 
 
 class AdversarialClassifier(tf.keras.models.Model):
@@ -42,7 +47,7 @@ class AdversarialClassifier(tf.keras.models.Model):
                 )
         self.build(input_shape)
 
-    def compile(self, classifier_optimizer, adversarial_optimizer, ε=3):
+    def compile(self, classifier_optimizer, adversarial_optimizer, ε=3, adversarial_steps=7):
         """
         Overrides the compile step.
         """
@@ -50,18 +55,20 @@ class AdversarialClassifier(tf.keras.models.Model):
         # Used in training loop only
         self.optimizer_a = adversarial_optimizer
         self.ε = ε
+        self.adversarial_steps = adversarial_steps
         self.clipper = lambda x: tf.clip_by_value(x, -self.ε, self.ε)
         self.cross_entropy = tf.keras.losses.CategoricalCrossentropy(from_logits=True)
 
         # Prepare resNet
         self.optimizer_c = classifier_optimizer
         self.resNet.get_layer("predictions").activation = None
-        self.resNet.compile(optimizer=self.optimizer_c, loss=self.cross_entropy, metrics=["acc"])
+        self.θ = self.resNet.trainable_variables
 
         # Create loss trackers
         self.a_loss_tracker = tf.keras.metrics.Mean(name="loss_a")
         self.c_loss_tracker = tf.keras.metrics.Mean(name="loss_c")
         self.acc_tracker = tf.keras.metrics.Mean(name="acc")
+
 
     def train_step(self, inputs):
         """
@@ -83,11 +90,11 @@ class AdversarialClassifier(tf.keras.models.Model):
         δ = tf.Variable(tf.zeros([batch_size] + list(self.dim),
                         dtype="float32"),
                         constraint=self.clipper,
-                        aggregation=tf.VariableAggregation.SUM,
-                        synchronization=tf.VariableSynchronization.AUTO
+                        #aggregation=tf.VariableAggregation.SUM,
+                        #synchronization=tf.VariableSynchronization.AUTO
                         )
-        # Perform 7 update steps of PGD
-        for step in range(7):
+        # Perform n update steps of PGD
+        for step in range(self.adversarial_steps):
             with tf.GradientTape() as tape:
                 tape.watch(δ)
                 # Add noise
@@ -99,12 +106,19 @@ class AdversarialClassifier(tf.keras.models.Model):
                              self.cross_entropy(y_fake, y_pred) )
             # Calculate gradients and apply their signs
             grads = tape.gradient(loss_adv, [δ])
-            self.optimizer_a.apply_gradients(zip([tf.math.sign(grads)], [δ]))
+            self.optimizer_a.apply_gradients(zip([tf.math.sign(grads[0])], [δ]))
 
         # ---------------------------- #
         #  Step II - Update classifier
         # ---------------------------- #
-        loss_c, acc = self.resNet.train_on_batch(x_fake, y_real)
+
+        with tf.GradientTape() as tape:
+            y_pred = self.resNet(x_fake)
+            acc = tf.reduce_sum(tf.cast(tf.argmax(y_pred, axis=-1) == tf.argmax(y_real, axis=-1), dtype="float32")) / batch_size
+            loss_c = self.cross_entropy(y_real, y_pred)
+        # Calculate gradients
+        grads = tape.gradient(loss_c, self.θ)
+        self.optimizer_c.apply_gradients(zip(grads, self.θ))
 
         # Update loss trackers
         self.a_loss_tracker.update_state(loss_adv)
@@ -122,29 +136,38 @@ class AdversarialClassifier(tf.keras.models.Model):
 
 if __name__ == "__main__":
 
-    model = AdversarialClassifier(num_classes=10,
+    physical_devices = tf.config.list_physical_devices("GPU")
+    tf.config.experimental.set_memory_growth(physical_devices[0], enable=True)
+
+    model = AdversarialClassifier(num_classes=4,
                                   input_shape=(112, 112, 3),
                                   weights=None
                                   )
 
     model.summary()
 
-    # optimizers
+    # optimizerss
     opt_a = tf.keras.optimizers.Adam(learning_rate=0.2)
     opt_c = tf.keras.optimizers.Adam(learning_rate=0.0001)
 
     model.compile(adversarial_optimizer=opt_a, classifier_optimizer=opt_c, ε=3)
 
-    # Fake data
-    X = tf.stack([tf.random.normal(shape=(112, 112, 3)) for _ in range(200)])
-    Y = tf.stack([tf.one_hot(np.random.randint(10)*1, 10) for _ in range(200)])
+    # dataset = create_data_set(,
+    #                           img_dim=112,
+    #                           batch_size=1,
+    #                           label_dict={"cow": 0, "dog": 1, "mac": 2, "tig": 3})
 
-    print(X.shape)
-    print(Y.shape)
-    history = model.fit(x=X, y=Y, batch_size=12, epochs=1)
+    data_gen = ImageDataGenerator(validation_split=0.2, preprocessing_function=preprocess)
 
+    train_gen = data_gen.flow_from_directory(directory="/home/simon/PycharmProjects/AdversarialRobustness/images/",
+                                             target_size=(112, 112),
+                                             class_mode='categorical',
+                                             batch_size=4,
+                                             seed=123,
+                                             subset="training"
+                                             )
 
-    #print(history)
+    history = model.fit(train_gen, epochs=100, steps_per_epoch=train_gen.n // train_gen.batch_size)
 
 
 
